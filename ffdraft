@@ -1,0 +1,328 @@
+
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+
+# ----------------------------- Settings & State ------------------------------
+
+@dataclass
+class LeagueSettings:
+    teams: int = 12
+    roster: Dict[str, int] = field(default_factory=lambda: {"QB":1,"RB":2,"WR":2,"TE":0,"FLEX":1})
+    flex_eligible: List[str] = field(default_factory=lambda: ["RB","WR","TE"])
+    bench_slots: int = 6
+
+@dataclass
+class DraftState:
+    settings: LeagueSettings
+    total_rounds: int
+    picks_made: List[str] = field(default_factory=list)
+    picks_by_team: Dict[int, List[str]] = field(default_factory=dict)
+    user_slot: int = 1
+    current_pick: int = 1  # 1-based
+
+    def round_num(self) -> int:
+        return ((self.current_pick-1)//self.settings.teams) + 1
+
+    def next_pick_for_slot(self, slot: int) -> int:
+        picks = []
+        total_picks = self.total_rounds * self.settings.teams
+        for pick in range(self.current_pick, total_picks+1):
+            round_num = ((pick-1)//self.settings.teams) + 1
+            on_clock_slot = ((pick-1) % self.settings.teams) + 1 if (round_num % 2 == 1) else self.settings.teams - ((pick-1) % self.settings.teams)
+            if on_clock_slot == slot:
+                return pick
+        return -1
+
+# ----------------------------- Utility Helpers -------------------------------
+
+def _current_on_clock(state: DraftState) -> int:
+    r = state.round_num()
+    return ((state.current_pick-1) % state.settings.teams) + 1 if (r % 2 == 1) else state.settings.teams - ((state.current_pick-1) % state.settings.teams)
+
+def _ensure_available_col(df: pd.DataFrame) -> pd.DataFrame:
+    if 'available' not in df.columns:
+        df = df.copy()
+        df['available'] = True
+    return df
+
+# --------------------------- Market & Replacement ----------------------------
+
+def market_demand(state: DraftState, df: pd.DataFrame) -> Dict[str, float]:
+    """Estimate remaining starting slots room-wide (with FLEX distributed by supply)."""
+    df = _ensure_available_col(df)
+    teams = state.settings.teams
+    roster = state.settings.roster
+    # Count drafted starters naive (by pos only)
+    pos_drafted_counts = df[~df['available']].pos.value_counts().to_dict()
+    remaining = {p: teams*roster.get(p,0) - pos_drafted_counts.get(p,0) for p in ["QB","RB","WR","TE"]}
+    # FLEX allocation by available supply share
+    flex_total = teams*roster.get("FLEX",0)
+    elig = df[(df['available']) & (df['pos'].isin(state.settings.flex_eligible))].pos.value_counts().to_dict()
+    total_elig = sum(elig.values()) if elig else 1
+    for p in state.settings.flex_eligible:
+        share = (elig.get(p,0)/total_elig) if total_elig>0 else 0
+        remaining[p] = max(0.0, remaining.get(p,0)) + flex_total * share
+    return remaining
+
+def availability_probability(adp: float, current_pick: int, next_pick: int, room_volatility: float=8.0) -> float:
+    """Approximate probability a player survives from current_pick to next_pick based on ADP."""
+    from math import erf, sqrt
+    if next_pick <= current_pick:
+        return 0.0
+    z = (next_pick - adp) / room_volatility
+    surv = 0.5*(1 + erf(z/np.sqrt(2)))
+    return float(max(0.0, min(1.0, surv)))
+
+def anticipate_runs(df: pd.DataFrame, state: DraftState, room_volatility: float=8.0) -> Dict[str, float]:
+    """Expected number drafted by others at each position before user's next pick."""
+    df = _ensure_available_col(df)
+    next_after = DraftState(settings=state.settings, total_rounds=state.total_rounds,
+                            picks_made=list(state.picks_made), picks_by_team=dict(state.picks_by_team),
+                            user_slot=state.user_slot, current_pick=state.current_pick+1).next_pick_for_slot(state.user_slot)
+    if next_after == -1:
+        next_after = state.total_rounds*state.settings.teams + 1
+    # Only other teams' picks count
+    other_picks = max(0, next_after - state.current_pick - 0)
+    exp = {"QB":0.0,"RB":0.0,"WR":0.0,"TE":0.0}
+    avail = df[df['available']].copy()
+    for p in ["QB","RB","WR","TE"]:
+        pool = avail[avail.pos==p]
+        # Expected drafted = sum over players of (1 - survival to next_after)
+        exp[p] = float((1.0 - pool['adp'].apply(lambda a: availability_probability(a, state.current_pick, next_after, room_volatility))).sum())
+        # cap by remaining other picks
+        exp[p] = float(min(exp[p], other_picks))
+    return exp
+
+def forward_replacement_values(df: pd.DataFrame, state: DraftState, run_forecast: Dict[str,float]) -> Dict[str,float]:
+    """Set a forward-looking replacement baseline using expected drafted quantity before next pick."""
+    df = _ensure_available_col(df)
+    baselines = {}
+    for p in ["QB","RB","WR","TE"]:
+        pool = df[(df['pos']==p) & (df['available'])].sort_values("proj", ascending=False).reset_index(drop=True)
+        k = int(round(run_forecast.get(p,0)))
+        idx = min(len(pool)-1, max(0, k))  # look ahead k players off the board
+        rep = float(pool.proj.iloc[idx]) if len(pool)>0 else 0.0
+        baselines[p] = rep
+    return baselines
+
+# ------------------------------- Team Needs ----------------------------------
+
+def user_team_needs(state: DraftState, df: pd.DataFrame) -> Dict[str, int]:
+    """Remaining starting needs for the user; FLEX is explicit."""
+    df = _ensure_available_col(df)
+    roster = state.settings.roster.copy()
+    picks_user = state.picks_by_team.get(state.user_slot, [])
+    from collections import Counter
+    cnt = Counter(df[df.player.isin(picks_user)]['pos'])
+    needs = {p: max(0, roster.get(p,0) - cnt.get(p,0)) for p in ["QB","RB","WR","TE"]}
+    # FLEX
+    flex_need = roster.get("FLEX",0)
+    surplus = 0
+    for p in state.settings.flex_eligible:
+        surplus += max(0, cnt.get(p,0) - roster.get(p,0))
+    needs["FLEX"] = max(0, flex_need - surplus)
+    return needs
+
+# ------------------------------ Tier Detection --------------------------------
+
+def compute_tiers(df: pd.DataFrame, max_tiers:int=5, gap_quantile:float=0.80) -> Dict[str, Dict[str,int]]:
+    """Auto-tier players per position from projection drop-offs.
+       Returns: {pos: {player_name: tier_index (1=elite)}}.
+    """
+    tiers = {}
+    for p in ["QB","RB","WR","TE"]:
+        pos_df = df[df.pos==p].sort_values("proj", ascending=False).reset_index(drop=True)
+        if pos_df.empty:
+            tiers[p] = {}
+            continue
+        diffs = pos_df['proj'].diff(-1).abs().fillna(0.0)
+        threshold = diffs.quantile(gap_quantile)
+        tier_idx = 1
+        mapping = {}
+        for i, row in pos_df.iterrows():
+            mapping[row['player']] = tier_idx
+            if diffs.iloc[i] >= threshold and tier_idx < max_tiers:
+                tier_idx += 1
+        tiers[p] = mapping
+    return tiers
+
+# ------------------------------- Scoring Model --------------------------------
+
+def value_now(player_row, base_rep: Dict[str,float], needs: Dict[str,int], flex_weight: float=1.0) -> float:
+    """Marginal value if we pick this player now, with explicit FLEX weighting."""
+    pos = player_row['pos']
+    proj = float(player_row['proj'])
+    # If we still need that starting pos slot
+    if needs.get(pos,0) > 0:
+        return proj - base_rep.get(pos, 0.0)
+    # Flex contribution
+    if needs.get("FLEX",0) > 0 and pos in ["RB","WR","TE"]:
+        # FLEX baseline: max of eligible baselines
+        flex_base = max(base_rep.get("RB",0.0), base_rep.get("WR",0.0), base_rep.get("TE",0.0))
+        return flex_weight * (proj - flex_base)
+    # Bench depth (discounted)
+    bench_discount = 0.5
+    rep = np.median(list(base_rep.values())) if base_rep else 0.0
+    return bench_discount * (proj - rep)
+
+def adjusted_pick_value(player_row, state: DraftState, df: pd.DataFrame,
+                        room_volatility: float=8.0,
+                        early_round_tier_boost: float=0.12,
+                        late_round_arbitrage_boost: float=0.08) -> Dict[str,float]:
+    """Compute composite score with run anticipation, tiers, and round-aware arbitrage."""
+    df = _ensure_available_col(df)
+    # Look-ahead
+    run_fc = anticipate_runs(df, state, room_volatility=room_volatility)
+    base_rep = forward_replacement_values(df, state, run_fc)
+    needs = user_team_needs(state, df)
+
+    # Round-aware knobs
+    current_round = state.round_num()
+    total_rounds = state.total_rounds
+    early_phase = 1.0 if current_round <= 3 else 0.0
+    late_phase = (current_round / total_rounds)  # grows later
+
+    # Value now
+    v_now = value_now(player_row, base_rep, needs, flex_weight=1.1)
+
+    # Survival probability to next user pick
+    temp_state = DraftState(settings=state.settings, total_rounds=state.total_rounds,
+                            picks_made=list(state.picks_made), picks_by_team=dict(state.picks_by_team),
+                            user_slot=state.user_slot, current_pick=state.current_pick+1)
+    next_after = temp_state.next_pick_for_slot(state.user_slot)
+    if next_after == -1:
+        next_after = state.total_rounds*state.settings.teams + 1
+    p_survive = availability_probability(player_row['adp'], state.current_pick, next_after, room_volatility=room_volatility)
+
+    # Arbitrage vs ADP (negative delta -> sleeper underrates -> good to wait)
+    rank = float(player_row.get('rank', np.nan))
+    adp = float(player_row.get('adp', np.nan))
+    arb_delta = (rank - adp) if (not np.isnan(rank) and not np.isnan(adp)) else 0.0
+    # Round-aware arbitrage: small early, stronger late
+    arb_component = (-arb_delta) * (late_round_arbitrage_boost * late_phase)
+
+    # Tier protection boost (early)
+    tiers = compute_tiers(df)
+    tier_idx = tiers.get(player_row['pos'], {}).get(player_row['player'], 5)
+    # If player is in a better tier than typical remaining at that pos, reward
+    # Compute median tier among top N remaining at this position
+    pos_avail = df[(df['available']) & (df['pos']==player_row['pos'])].copy()
+    pos_tiers = [tiers[player_row['pos']].get(nm, 5) for nm in pos_avail['player'].tolist()]
+    typical_tier = np.median(pos_tiers) if pos_tiers else 5
+    tier_edge = max(0.0, typical_tier - tier_idx)  # better tier -> positive
+    tier_component = early_round_tier_boost * early_phase * tier_edge * max(0.8, 1.2 - p_survive)
+
+    # E[pass] for info
+    e_pass = p_survive * v_now
+
+    # Final score: value now + run-risk emphasis + tier early + arbitrage late
+    run_risk = (1 - p_survive)
+    score = v_now * (1 + 0.30*run_risk) + tier_component + arb_component
+
+    return {
+        "V_now": float(v_now),
+        "P_survive": float(p_survive),
+        "RunRisk": float(run_risk),
+        "Tier": int(tier_idx),
+        "Arb_delta_rank": float(arb_delta),
+        "E_pass": float(e_pass),
+        "Score": float(score),
+    }
+
+# ------------------------------ Public Interface ------------------------------
+
+def recommend_picks(players_df: pd.DataFrame, state: DraftState, top_n:int=12,
+                    room_volatility: float=8.0) -> pd.DataFrame:
+    df = _ensure_available_col(players_df)
+    avail = df[df['available']].copy()
+    if avail.empty:
+        return avail
+    comps = []
+    for _, row in avail.iterrows():
+        comps.append(adjusted_pick_value(row, state, df, room_volatility=room_volatility))
+    for k in comps[0].keys():
+        avail[k] = [c[k] for c in comps]
+    cols = ["player","pos","team","proj","adp","rank","V_now","P_survive","RunRisk","Tier","Arb_delta_rank","E_pass","Score"]
+    avail = avail[cols].sort_values(["Score","V_now","proj"], ascending=[False,False,False]).reset_index(drop=True)
+    return avail.head(top_n)
+
+def mark_picked(players_df: pd.DataFrame, player_name: str, state: DraftState, team_slot: int, pick_number: int):
+    idx = players_df.index[players_df['player']==player_name]
+    if len(idx)==0:
+        raise ValueError(f"Player '{player_name}' not found in player list.")
+    players_df.loc[idx, 'available'] = False
+    state.picks_made.append(player_name)
+    state.picks_by_team.setdefault(team_slot, []).append(player_name)
+    state.current_pick = pick_number + 1
+
+def make_state(user_slot:int, total_rounds:int, settings:LeagueSettings=None) -> DraftState:
+    if settings is None:
+        settings = LeagueSettings()
+    return DraftState(settings=settings, total_rounds=total_rounds, user_slot=user_slot, current_pick=1)
+
+
+# Quick smoke test: run one small league simulation with the upgraded engine to ensure it works.
+import pandas as pd, numpy as np, random
+from importlib import util
+
+ENGINE_PATH = "/mnt/data/snake_draft_engine.py"
+spec = util.spec_from_file_location("snake_draft_engine", ENGINE_PATH)
+engine = util.module_from_spec(spec)
+spec.loader.exec_module(engine)
+
+random.seed(10); np.random.seed(10)
+
+# Build a small pool
+positions = ["QB","RB","WR","TE"]
+teams = ["BUF","PHI","BAL","SF","KC","DAL","NYJ","LAR","MIA","CIN","DET","SEA"]
+
+rows = []
+stars = [
+    ("Josh Allen","QB","BUF", 410, 10),
+    ("Patrick Mahomes","QB","KC", 380, 12),
+    ("Christian McCaffrey","RB","SF", 390, 1),
+    ("Tyreek Hill","WR","MIA", 370, 3),
+    ("CeeDee Lamb","WR","DAL", 403, 8),
+    ("Amon-Ra St. Brown","WR","DET", 360, 9),
+    ("Travis Kelce","TE","KC", 250, 15),
+    ("Sam LaPorta","TE","DET", 230, 40),
+    ("Bijan Robinson","RB","ATL", 330, 6),
+    ("Breece Hall","RB","NYJ", 290, 20),
+]
+for n,p,t,proj,adp in stars:
+    rows.append({"player":n,"pos":p,"team":t,"proj":proj,"adp":adp,"rank":adp,"available":True})
+
+# Fill depth
+while len(rows) < 150:
+    pos = np.random.choice(positions, p=[0.14,0.40,0.38,0.08])
+    team = np.random.choice(teams)
+    name = f"Player {len(rows)+1} {pos}"
+    base = {"QB": 240, "RB": 165, "WR": 165, "TE": 140}[pos]
+    proj = float(np.random.normal(base, {"QB":40,"RB":30,"WR":30,"TE":24}[pos]))
+    adp = float(np.random.uniform(30, 180))
+    rows.append({"player":name,"pos":pos,"team":team,"proj":max(90,proj),"adp":adp,"rank":adp,"available":True})
+
+players = pd.DataFrame(rows).sort_values("adp").reset_index(drop=True)
+players["rank"] = players["adp"]
+
+settings = engine.LeagueSettings()
+state = engine.make_state(user_slot=11, total_rounds=10, settings=settings)
+
+# Draft 15 picks to exercise recommendation scoring
+for pick in range(1, 16):
+    on_clock = ((pick-1) % settings.teams) + 1 if ( ((pick-1)//settings.teams + 1) % 2 == 1) else settings.teams - ((pick-1) % settings.teams)
+    if on_clock == state.user_slot:
+        recs = engine.recommend_picks(players, state, top_n=5)
+        # choose top suggestion
+        pick_name = recs.iloc[0]["player"]
+    else:
+        # ADP autopick
+        pick_name = players[players.available].sort_values("adp").iloc[0]["player"]
+    engine.mark_picked(players, pick_name, state, team_slot=on_clock, pick_number=pick)
+
+print("Smoke test completed. Current pick:", state.current_pick)
+print("Top recommendation snapshot:")
+display_cols = ["player","pos","proj","adp","V_now","P_survive","RunRisk","Tier","Arb_delta_rank","Score"]
+print(engine.recommend_picks(players, state, top_n=8)[display_cols].to_string(index=False))
