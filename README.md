@@ -20,6 +20,12 @@ To view the best available players:
 python draft_tool.py --top 15
 ```
 
+Example with custom ranking weights:
+
+```bash
+python draft_tool.py --top 15 --adp-weight 0.7 --proj-weight 0.3
+```
+
 To load a different dataset, supply the CSV path with `--data`.
 
 ### Draft Simulation Modes
