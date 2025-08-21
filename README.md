@@ -1,29 +1,29 @@
 # Fantasy Draft Helper
 
-Utilities for running a fantasy football draft from the command line.
+Utilities for running a fantasy football draft from Python or the command line.
 
 ## Getting Started
 
-The `draft_tool.py` script reads player projection data from `ffdata_8.15_25.csv`.
+The `draft_tool` package reads player projection data from `ffdata_8.15_25.csv`.
 Player **ADP** comes from the `Sleeper` column and a custom **rank** blends
 ADP and projection-based ordering.  The balance can be adjusted with
 `--adp-weight` and `--proj-weight`.
 
 ```bash
-./setup.sh                  # install required packages
-python draft_tool.py --help # show available options
+./setup.sh                     # install required packages
+python -m draft_tool --help    # show available options
 ```
 
 To view the best available players:
 
 ```bash
-python draft_tool.py --top 15
+python -m draft_tool --top 15
 ```
 
 Example with custom ranking weights:
 
 ```bash
-python draft_tool.py --top 15 --adp-weight 0.7 --proj-weight 0.3
+python -m draft_tool --top 15 --adp-weight 0.7 --proj-weight 0.3
 ```
 
 To load a different dataset, supply the CSV path with `--data`.
@@ -43,14 +43,26 @@ Roster slots are configurable with `--roster`; the default is
 Example full simulation:
 
 ```bash
-python draft_tool.py --mode full --teams 12
+python -m draft_tool --mode full --teams 12
 ```
 
 Example user-assisted draft (you will be prompted for picks):
 
 ```bash
-python draft_tool.py --mode user --teams 10
+python -m draft_tool --mode user --teams 10
 ```
 
 At the end of a simulation the script prints each team's roster grouped by
 position.
+
+### Using as an API
+
+The core functionality is available programmatically via `DraftSimulator`:
+
+```python
+from draft_tool import DraftSimulator, format_rosters
+
+sim = DraftSimulator(teams=3, rounds=2)
+sim.run(mode="full")
+print(format_rosters(sim.summary()))
+```
